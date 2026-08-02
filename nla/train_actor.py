@@ -334,6 +334,19 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 f"don't want KL."
             )
 
+        # k1 (log p − log p_ref, Miles' default) as a direct loss term has zero
+        # expected gradient — p_ref's logprob is a constant w.r.t. θ and
+        # E_{x∼p}[∇ log p(x)] = 0 — so the penalty only adds noise and the
+        # policy drifts from the reference unchecked. k2/k3 give a gradient
+        # proportional to the divergence.
+        if role == "actor" and args.use_kl_loss:
+            assert args.kl_loss_type != "k1", (
+                "--kl-loss-type k1 as a direct loss term (--use-kl-loss) has zero "
+                "expected gradient: the reference logprob is constant w.r.t. the "
+                "policy and E[∇ log p] = 0. Pass --kl-loss-type k2 (what the released "
+                "runs used) or k3/low_var_kl."
+            )
+
         # Train/sample consistency guard. All released NLA runs train with
         # exactly ONE optimizer step per rollout (global batch == rollout
         # samples) — we have not tested anything else. A --global-batch-size

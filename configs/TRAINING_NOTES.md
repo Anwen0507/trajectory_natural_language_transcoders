@@ -206,7 +206,7 @@ LR-scan winner above scaled up by the √(batch) rule (×√2 for 512 → 1024):
 | global batch (samples) | 512 | 1024 |
 | actor (AV) lr | 1e-5 | 1.41e-5 (= 1e-5 × √2) |
 | critic (AR) lr | 5e-5 | 1.41e-5 (parity with actor)† |
-| KL loss (`--use-kl-loss --kl-loss-coef`) | — | 0.01 |
+| KL loss (`--use-kl-loss --kl-loss-coef`, `--kl-loss-type k2`) | — | 0.01 |
 | response cap | 150 tok (truncated → reward −2) | same |
 | saved at | — | `rollout_id: 4199` (sidecar) |
 | final fve_nrm | — | 0.752 |
@@ -217,7 +217,11 @@ a short-horizon artifact (see Lesson above) and ran at parity. The `training:` b
 in each released checkpoint's `nla_meta.yaml` records what was in effect at save time.
 
 `configs/rl.sh` defaults now ship this configuration: parity LRs at **1.41e-5**,
-1024-sample global batch, KL loss coef **0.01**.
+1024-sample global batch, KL loss coef **0.01** with the **k2** estimator. (An earlier
+revision of `rl.sh` omitted `--kl-loss-type`, which falls back to Miles' default `k1`;
+as a direct loss term k1 has zero expected gradient — the reference logprob is a
+constant w.r.t. the policy — so that configuration trains with effectively no KL
+penalty. The released runs used k2.)
 
 **Reading the paper appendix against this table**: the paper's "batch size of 128" is
 prompts per step (× G=8 samples = the 1024-sample global batch here), and its

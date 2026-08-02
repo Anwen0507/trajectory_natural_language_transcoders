@@ -349,6 +349,14 @@ class NLAMegatronActor(MegatronTrainRayActor):
                 f"(get_grpo_returns discards the kl tensor). Use "
                 f"--use-kl-loss --kl-loss-coef {args.kl_coef} instead."
             )
+        # k1 (log p − log p_ref) as a direct loss has zero expected gradient —
+        # see the matching guard in nla/train_actor.py.
+        if role == "actor" and args.use_kl_loss:
+            assert args.kl_loss_type != "k1", (
+                "--kl-loss-type k1 as a direct loss term (--use-kl-loss) has zero "
+                "expected gradient. Pass --kl-loss-type k2 (what the released runs "
+                "used) or k3/low_var_kl."
+            )
 
         if role == "critic" and args.force_use_critic:
             # RolloutManager partitions by actor_dp; Megatron critic typically
