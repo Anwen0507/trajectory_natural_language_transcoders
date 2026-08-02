@@ -288,6 +288,7 @@ python train.py \
     --prompt-data $RL_PARQUET \
     --hf-checkpoint $ACTOR_SFT_CKPT \
     --ref-load $ACTOR_SFT_CKPT \                 # SFT'd actor, NOT base model
+    --use-kl-loss --kl-loss-coef 0.01 --kl-loss-type k2 \  # k2, not Miles' default k1 (see configs/rl.sh)
     --critic-load $CRITIC_SL_CKPT \              # SL-trained critic checkpoint — critic RayTrainGroup starts here
     --critic-save $RUN_DIR/critic \
     --critic-lr 1.41e-5 \

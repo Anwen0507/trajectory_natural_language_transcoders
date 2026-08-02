@@ -14,8 +14,8 @@
 # with matching token IDs / prompt templates.
 #
 # Defaults reproduce the released Qwen2.5-7B run: 128 prompts/rollout x 8
-# samples/prompt = 1024-sample global batch, lr 1.41e-5, KL loss coef 0.01,
-# 150-token response cap. See TRAINING_NOTES.md "Production run" for the full
+# samples/prompt = 1024-sample global batch, lr 1.41e-5, KL loss coef 0.01
+# (k2 estimator), 150-token response cap. See TRAINING_NOTES.md "Production run" for the full
 # table and how these relate to the values recorded in the released
 # checkpoints' nla_meta.yaml sidecars.
 #
@@ -51,10 +51,7 @@
 # but it's action="store_true" — once passed, callers can't un-pass it. Gate on
 # env var so KL_LOSS_COEF=0 drops the flags entirely (small-scale test runs uses this to
 # skip the --ref-load / DCP→HF conversion step).
-# --kl-loss-type k2 is required: Miles defaults to k1 (log p − log p_ref), which as a
-# direct loss term has zero expected gradient — the ref logprob is a constant and
-# E_{x∼p}[∇ log p(x)] = 0 — so the penalty would only add noise. k2 ((log p − log p_ref)²/2)
-# gives a gradient proportional to the log-ratio, an actual pull toward the reference.
+# k2, not Miles' default k1: k1 as a direct loss term has zero expected gradient.
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.01}"
 if python3 -c "import sys; sys.exit(0 if float('$KL_LOSS_COEF') != 0 else 1)"; then
     KL_FLAGS=(--use-kl-loss --kl-loss-coef "$KL_LOSS_COEF" --kl-loss-type k2)

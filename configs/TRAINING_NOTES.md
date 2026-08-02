@@ -217,11 +217,10 @@ a short-horizon artifact (see Lesson above) and ran at parity. The `training:` b
 in each released checkpoint's `nla_meta.yaml` records what was in effect at save time.
 
 `configs/rl.sh` defaults now ship this configuration: parity LRs at **1.41e-5**,
-1024-sample global batch, KL loss coef **0.01** with the **k2** estimator. (An earlier
-revision of `rl.sh` omitted `--kl-loss-type`, which falls back to Miles' default `k1`;
-as a direct loss term k1 has zero expected gradient — the reference logprob is a
-constant w.r.t. the policy — so that configuration trains with effectively no KL
-penalty. The released runs used k2.)
+1024-sample global batch, KL loss coef **0.01** with the **k2** estimator. (Our runs
+used k2. An earlier revision of `rl.sh` omitted `--kl-loss-type` and so fell back to
+Miles' default `k1`, which as a direct loss term has zero expected gradient — effectively
+no KL penalty — so set it explicitly.)
 
 **Reading the paper appendix against this table**: the paper's "batch size of 128" is
 prompts per step (× G=8 samples = the 1024-sample global batch here), and its
@@ -275,7 +274,7 @@ specific cautions:
 ## RL infrastructure notes
 
 - `--sglang-disable-radix-cache` — required for input_embeds path
-- `del payload["input_ids"]` in `nla_generate.py` — SGLang confused by both ids+embeds. Symptom: k3 (the GRPO importance-ratio diagnostic) floored at ≈0.20; after fix k3≈0.001.
+- `del payload["input_ids"]` in `nla_generate.py` — SGLang confused by both ids+embeds. Symptom: `tis_k3` (the train↔rollout logprob-mismatch diagnostic — unrelated to `--kl-loss-type k3`) floored at ≈0.20; after fix ≈0.001.
 - `--group-rm` for batched critic reward computation (critic_fwd via Ray remote, reward off rollout GPU)
 - Step time ~47s with rollout_batch=64×8 (90% is SGLang rollout wait — actor train is 10-20s)
 - **`export NLA_EMBED_DUMP_DIR=/dev/shm/nla`** — the per-step 1.1GB embedding dump for
