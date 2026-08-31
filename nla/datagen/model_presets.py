@@ -41,6 +41,14 @@ class ModelPreset:
 # device"). Explicit "cuda:0" bypasses the estimator — fail loud with honest
 # CUDA OOM instead of silent offload. Observed on the 27b extraction run.
 MODELS: dict[str, ModelPreset] = {
+    "qwen05b": ModelPreset(
+        hf_name="Qwen/Qwen2.5-0.5B-Instruct",
+        num_layers=24,
+        d_model=896,
+        extractor_kwargs={"batch_size": 4, "max_length": 1024},
+        turn_marker="<|im_start|>",
+        accepts_system_role=True,
+    ),
     "qwen7b": ModelPreset(
         hf_name="Qwen/Qwen2.5-7B-Instruct",
         num_layers=28,
@@ -92,7 +100,8 @@ def resolve(cfg: dict[str, Any]) -> dict[str, Any]:
     assert key in MODELS, f"unknown model preset {key!r}, have: {sorted(MODELS)}"
     m = MODELS[key]
     cfg.setdefault("base_model", m.hf_name)
-    cfg.setdefault("layer_index", m.default_layer)
+    if "checkpoint_depths" not in cfg:
+        cfg.setdefault("layer_index", m.default_layer)
     cfg.setdefault("stage0", {})
     cfg["stage0"].setdefault("extractor_kwargs", dict(m.extractor_kwargs))
     return cfg

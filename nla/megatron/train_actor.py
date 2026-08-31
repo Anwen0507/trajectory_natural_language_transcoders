@@ -73,7 +73,12 @@ from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
 from nla.injection import inject_at_marked_positions
 from nla.megatron.checkpoint import gather_embedding_for_dump
 from nla.embed_store import get_embed_store
-from nla.schema import MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, normalize_activation
+from nla.schema import (
+    MM_ACTIVATION_KEY,
+    MM_ACTIVATIONS_KEY,
+    MM_CRITIC_TOKENS_KEY,
+    normalize_activation,
+)
 from nla.train_actor import (
     CRITIC_ONLY_MM_KEYS,
     NLAFSDPActor,
@@ -419,8 +424,8 @@ class NLAMegatronActor(MegatronTrainRayActor):
             gpt = _gpt_model(chunk)
             pre_process = bool(getattr(gpt, "pre_process", False))
             post_process = bool(getattr(gpt, "post_process", False))
-            # Strip nla_activation from kwargs on ALL chunks (avoids TypeError on
-            # PP stages that don't inject). For injecting actors, also stash it.
+            # Strip both NLA activation kwargs on ALL chunks (avoids TypeError
+            # on PP stages that don't inject). For injecting actors, also stash.
             gpt.register_forward_pre_hook(
                 self._make_strip_hook(stash=injects and pre_process),
                 with_kwargs=True,
@@ -471,11 +476,11 @@ class NLAMegatronActor(MegatronTrainRayActor):
 
 
     def _make_strip_hook(self, stash: bool):
-        """Pre-hook on GPTModel: pop nla_activation from kwargs.
+        """Pre-hook on GPTModel: pop NLA activation kwargs.
 
         model.py:419 (train) and :252 (forward_only) spread
         batch["multimodal_train_inputs"] into model(**kwargs). GPTModel.forward
-        doesn't accept nla_activation → TypeError. Popping here is the only
+        doesn't accept either NLA key → TypeError. Popping here is the only
         interception point that doesn't require editing miles' forward_step
         closures. The pop is from the kwargs COPY — batch["multimodal_train_inputs"]
         stays intact for the loss function to read.
@@ -486,9 +491,24 @@ class NLAMegatronActor(MegatronTrainRayActor):
         stash_cpu_ids = self._disable_train_offload
 
         def pre_hook(module, args, kwargs):
-            vecs = kwargs.pop(MM_ACTIVATION_KEY, None)
+            vecs = kwargs.pop(MM_ACTIVATIONS_KEY, None)
+            single = kwargs.pop(MM_ACTIVATION_KEY, None)
             kwargs.pop(MM_CRITIC_TOKENS_KEY, None)  # never reaches model forward
-            if stash and vecs is not None:
+            if stash and (vecs is not None or single is not None):
+                if vecs is None:
+                    vecs = single.unsqueeze(1)
+                assert vecs.ndim == 3, (
+                    f"actor activation bundle must be [B, K, d_model], got "
+                    f"{tuple(vecs.shape)}"
+                )
+                assert tuple(vecs.shape[1:]) == (
+                    self._nla_cfg.num_injection_sites,
+                    self._nla_cfg.d_model,
+                ), (
+                    f"actor activation bundle has shape {tuple(vecs.shape)}, "
+                    f"expected [B, {self._nla_cfg.num_injection_sites}, "
+                    f"{self._nla_cfg.d_model}]"
+                )
                 slot[0] = normalize_activation(vecs, inj_scale)
                 if stash_cpu_ids:
                     # GPU .nonzero() in fwd_hook deadlocks on prior async NCCL
@@ -539,7 +559,7 @@ class NLAMegatronActor(MegatronTrainRayActor):
             injected = inject_at_marked_positions(
                 input_ids=input_ids,
                 embeddings=emb_bsh,
-                vectors=vecs,
+                vectors=vecs.reshape(-1, self._nla_cfg.d_model),
                 inj_id=inj, left_id=left, right_id=right,
                 seq_slice=seq_slice,
             )
@@ -703,7 +723,14 @@ class NLAMegatronActor(MegatronTrainRayActor):
         # fires on PP stage 0 only → stage 1 hangs on P2P recv → 10min NCCL wait.
         n_none = sum(1 for mm in mm_inputs if mm is None)
         if n_none > 0:
-            n_vecs = sum(mm["nla_activation"].shape[0] for mm in mm_inputs if mm is not None)
+            n_vecs = 0
+            for mm in mm_inputs:
+                if mm is None:
+                    continue
+                if MM_ACTIVATIONS_KEY in mm:
+                    n_vecs += mm[MM_ACTIVATIONS_KEY].shape[0] * mm[MM_ACTIVATIONS_KEY].shape[1]
+                elif MM_ACTIVATION_KEY in mm:
+                    n_vecs += mm[MM_ACTIVATION_KEY].shape[0]
             raise RuntimeError(
                 f"rollout has {n_none}/{len(mm_inputs)} samples with multimodal_train_inputs=None "
                 f"({n_vecs} vectors survive). Injection hook will mismatch. "

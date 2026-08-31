@@ -121,6 +121,7 @@ def build_token_meta(
     tokenizer: Any,
     actor_template: str,
     critic_template: str | None = None,
+    expected_injection_sites: int = 1,
 ) -> NLATokenMeta:
     """One-shot: auto-pick injection char + neighbors, optionally compute critic suffix.
 
@@ -131,7 +132,13 @@ def build_token_meta(
     same function training-side verification uses.
     """
     inj_char, inj_id = find_injection_token(tokenizer)
-    left_id, right_id = compute_canonical_neighbors(tokenizer, actor_template, inj_char, inj_id)
+    left_id, right_id = compute_canonical_neighbors(
+        tokenizer,
+        actor_template,
+        inj_char,
+        inj_id,
+        expected_count=expected_injection_sites,
+    )
 
     suffix_ids = compute_critic_suffix_ids(tokenizer, critic_template) if critic_template else None
 

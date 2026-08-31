@@ -38,7 +38,7 @@ def inject_at_marked_positions(
     from ㊗ appearing in response text (user pasted it, multi-turn context).
 
     Raises:
-        AssertionError if GLOBAL count of valid matches != vectors.shape[0] —
+        RuntimeError if GLOBAL count of valid matches != vectors.shape[0] —
         means prompt template drift, tokenizer version mismatch, or data corruption.
         Fires identically on every TP rank (scan is over full input_ids).
     """
@@ -67,19 +67,18 @@ def inject_at_marked_positions(
     out = embeddings.clone()
     vectors = vectors.to(out.device, out.dtype)
     matches = (input_ids == inj_id).nonzero()  # [M, 2] — (batch_idx, seq_idx), row-major sorted
-    vec_idx = 0
+    valid_matches: list[tuple[int, int]] = []
     for b, p in matches.tolist():
         if p == 0 or p == seq_len - 1:
             continue
         if input_ids[b, p - 1] != left_id or input_ids[b, p + 1] != right_id:
             continue
-        if start <= p < end:
-            out[b, p - start] = vectors[vec_idx]
-        vec_idx += 1
+        valid_matches.append((b, p))
     expected = vectors.shape[0]
-    if vec_idx != expected:
+    if len(valid_matches) != expected:
         msg = (
-            f"found {vec_idx} injection sites with correct neighbors, expected {expected}. "
+            f"found {len(valid_matches)} injection sites with correct neighbors, "
+            f"expected {expected}. "
             f"Check prompt template drift, tokenizer version, cp accidentally >1, "
             f"or (RL) rollout samples with multimodal_train_inputs=None skipped in concat."
         )
@@ -90,4 +89,7 @@ def inject_at_marked_positions(
             print(f"[inject_at_marked_positions] FATAL: {msg}", flush=True)
             torch.distributed.destroy_process_group()
         raise RuntimeError(msg)
+    for vec_idx, (b, p) in enumerate(valid_matches):
+        if start <= p < end:
+            out[b, p - start] = vectors[vec_idx]
     return out

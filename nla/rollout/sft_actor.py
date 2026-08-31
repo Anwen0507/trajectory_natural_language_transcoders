@@ -10,7 +10,11 @@ import torch
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_tokenizer
 
-from nla.schema import MM_ACTIVATION_KEY
+from nla.schema import (
+    ACTIVATION_COLUMN,
+    ACTIVATIONS_KEY,
+    MM_ACTIVATIONS_KEY,
+)
 
 
 _TOKENIZER = None
@@ -47,9 +51,16 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         sample.reward = 0.0
         sample.loss_mask = loss_mask[-response_length:]
 
-        activation = torch.tensor(
-            sample.metadata["activation_vector"], dtype=torch.float32
-        ).view(1, -1)
-        sample.multimodal_train_inputs = {MM_ACTIVATION_KEY: activation}
+        raw = sample.metadata.get(ACTIVATIONS_KEY)
+        if raw is None:
+            # Legacy NLADataSource/sample contract.
+            raw = [sample.metadata[ACTIVATION_COLUMN]]
+        activations = torch.as_tensor(raw, dtype=torch.float32)
+        assert activations.ndim == 2, (
+            f"actor activations must be [K, d_model], got {tuple(activations.shape)}"
+        )
+        sample.multimodal_train_inputs = {
+            MM_ACTIVATIONS_KEY: activations.unsqueeze(0)
+        }
 
     return samples

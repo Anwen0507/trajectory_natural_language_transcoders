@@ -110,6 +110,12 @@ class NLAConfig:
     actor_prompt_template: str
     critic_prompt_template: str | None
     critic_num_layers: int | None
+    # Ordered actor-injection contract.  A joint checkpoint sample carries
+    # vectors in this exact order; the canonical prompt contains the same
+    # number of marker sites in the same order.  Legacy sidecars synthesize a
+    # single entry.
+    activation_checkpoint_names: tuple[str, ...]
+    activation_checkpoint_depths: tuple[int | None, ...]
 
     # Critic extraction: position = last token of the prompt. The prompt
     # template ends with a fixed suffix (e.g. "</text> <summary>") so the
@@ -143,6 +149,10 @@ class NLAConfig:
     def sqrt_d(self) -> float:
         return math.sqrt(self.d_model)
 
+    @property
+    def num_injection_sites(self) -> int:
+        return len(self.activation_checkpoint_names)
+
 
 def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
     """Load sidecar and verify against live tokenizer.
@@ -153,7 +163,7 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
     Asserts:
       - injection char tokenizes to expected ID (tokenizer version drift)
       - injection char is not UNK
-      - canonical actor prompt produces exactly one injection token
+      - canonical actor prompt produces exactly one injection token per checkpoint
       - neighbor IDs at inj_pos ± 1 match the sidecar
       - PM token (if present) tokenizes to expected ID
     """
@@ -189,6 +199,28 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
     # v2 writes "extraction_layer_index". Read both for back-compat.
     critic_k = critic_meta.get("extraction_layer_index", critic_meta.get("num_hidden_layers"))
 
+    checkpoint_dicts = extraction.get("checkpoints") or []
+    if checkpoint_dicts:
+        checkpoint_names = tuple(checkpoint["name"] for checkpoint in checkpoint_dicts)
+        checkpoint_depths = tuple(checkpoint.get("depth") for checkpoint in checkpoint_dicts)
+        assert len(set(checkpoint_names)) == len(checkpoint_names), (
+            f"duplicate activation checkpoint names in {meta_path}: {checkpoint_names}"
+        )
+        known_depths = [depth for depth in checkpoint_depths if depth is not None]
+        assert known_depths == sorted(set(known_depths)), (
+            f"activation checkpoint depths must be sorted and unique in {meta_path}; "
+            f"got {checkpoint_depths}"
+        )
+    else:
+        # Dataset schema v1 and model sidecars written before joint injection
+        # carry no checkpoint list.  Their actor always had exactly one site.
+        layer_index = extraction.get("layer_index")
+        depth = layer_index + 1 if layer_index is not None else None
+        checkpoint_names = (
+            f"block_{depth:02d}" if depth is not None else "activation",
+        )
+        checkpoint_depths = (depth,)
+
     cfg = NLAConfig(
         d_model=d_model,
         injection_char=t["injection_char"],
@@ -198,6 +230,8 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
         actor_prompt_template=templates.get("av") or templates["actor"],
         critic_prompt_template=templates.get("ar") or templates.get("critic"),
         critic_num_layers=critic_k,
+        activation_checkpoint_names=checkpoint_names,
+        activation_checkpoint_depths=checkpoint_depths,
         critic_suffix_ids=t.get("critic_suffix_ids"),
         injection_scale=injection_scale,
         mse_scale=mse_scale,
@@ -217,7 +251,11 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
     )
 
     live_left, live_right = compute_canonical_neighbors(
-        tokenizer, cfg.actor_prompt_template, cfg.injection_char, cfg.injection_token_id
+        tokenizer,
+        cfg.actor_prompt_template,
+        cfg.injection_char,
+        cfg.injection_token_id,
+        expected_count=cfg.num_injection_sites,
     )
     assert live_left == cfg.injection_left_neighbor_id, (
         f"left neighbor drift: tokenizer gives {live_left}, "
@@ -277,6 +315,14 @@ def write_model_sidecar(checkpoint_dir: str, cfg: NLAConfig, *, role: str, stage
             # re-resolve against a potentially different d_model.
             "injection_scale": cfg.injection_scale,
             "mse_scale": cfg.mse_scale,
+            "checkpoints": [
+                {"name": name, "depth": depth}
+                for name, depth in zip(
+                    cfg.activation_checkpoint_names,
+                    cfg.activation_checkpoint_depths,
+                    strict=True,
+                )
+            ],
         },
         "tokens": {
             "injection_char": cfg.injection_char,

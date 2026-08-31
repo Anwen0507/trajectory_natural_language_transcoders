@@ -12,10 +12,11 @@ The data-gen pipeline (activation extraction + API explanations) and NLA trainin
 
 | Column | Type | Which stage | Notes |
 |---|---|---|---|
-| `prompt` | `list[dict]` (messages) or `str` | all | AV-SFT/RL: `[{"role":"user","content":"Explain: <concept><INJECT></concept>"}]`. AR-SFT: complete formatted critic string. |
+| `prompt` | `list[dict]` (messages) or `str` | all | AV-SFT/RL: one ordered `<INJECT>` marker per activation checkpoint. AR-SFT: complete formatted critic string. |
 | `response` | `str` | AV-SFT only | `f"<explanation>\n{api_explanation}\n</explanation>"` |
-| `activation_vector` | `list[float]` len `d_model` | all | **RAW hidden states — no normalization.** Training normalizes at injection time per `extraction.injection_scale` / `mse_scale` in the sidecar. One dataset supports all norm experiments. |
-| provenance: `n_raw_tokens`, `activation_layer`, `doc_id` | various | all | Always carried (cheap). |
+| `activation_vector` | `list[float]` len `d_model` | legacy/selected checkpoint | **RAW hidden state — no normalization.** Used by the existing single-checkpoint AR path. |
+| `activation_{checkpoint}` | `list[float]` len `d_model` | joint AV-SFT/RL | One named RAW column per checkpoint. Sidecar order = prompt-site order = runtime tensor order. |
+| provenance: `n_raw_tokens`, `activation_layer`, `doc_id` | various | all | Always carried where applicable. Selected multi-checkpoint outputs additionally carry `activation_checkpoint` and `activation_depth`; joint files encode that identity in named columns plus the sidecar. |
 | debug: `detokenized_text_truncated` | `str` | all (optional) | Gate on `keep_debug_metadata: bool` — default True, drop for prod. `skip_special_tokens=True` applied. |
 
 **NOT in parquet (sidecar-only):** `injection_token_id`, neighbor IDs, `critic_suffix_ids` — these are dataset constants, shipped once in the sidecar, loaded once in `NLAFSDPActor.init`. Per-sample columns were dropped (v4).
@@ -28,6 +29,7 @@ The data-gen pipeline (activation extraction + API explanations) and NLA trainin
 |---|---|
 | `kind` | `"nla_dataset"` (parquet sidecar) or `"nla_model"` (checkpoint sidecar, written by `write_model_sidecar`) |
 | `extraction.d_model` | Asserted equal to `model.config.hidden_size` |
+| `extraction.checkpoints` | Ordered extraction locations. Depth `0` is embedding output; depth `N` is the output after `N` decoder blocks. `final_norm_applied=false` identifies raw residual-stream captures. |
 | `extraction.injection_scale` | L2-norm for injected vectors. `null` = inject raw, `"sqrt_d_model"` = default (ambient residual scale), float = custom. **Absent = `"sqrt_d_model"`**. |
 | `extraction.mse_scale` | L2-norm BOTH pred+gold normalized to before MSE. `null` = raw MSE (critic learns magnitude too), `"sqrt_d_model"` = direction-only (default), float = custom. **Independent of `injection_scale`.** |
 | `tokens.injection_token_id` + `injection_{left,right}_neighbor_id` | Hook scans for ID, verifies neighbors. Computed via `nla/schema.py:compute_canonical_neighbors`. |
@@ -52,7 +54,7 @@ All load-sites (train_actor, data_source, and future nla_generate/nla_rm) MUST u
 ### Useful for data-gen iteration
 
 - Miles reads parquet natively (`miles/utils/data.py:48-58`, `pyarrow.ParquetFile.iter_batches()`). Emit standard parquet — no custom format.
-- Miles supports `foo.parquet@[0:1000]` path-slicing for its stock data source, but `NLADataSource` does **not** (it bypasses Miles' loader to read `activation_vector` as zero-copy numpy). Slice the parquet upstream for smoke tests.
+- Miles supports `foo.parquet@[0:1000]` path-slicing for its stock data source, but `NLADataSource` does **not** (it bypasses Miles' loader to read activation columns as zero-copy numpy). Slice the parquet upstream for smoke tests.
 
 ---
 
@@ -168,25 +170,25 @@ Both changes follow miles' existing patterns. Both are upstreamable. Alternative
 | Microbatch fetch | `actor.py:337,448` | `"multimodal_train_inputs"` is in `get_batch`'s key list for both `_compute_log_prob` and train |
 | Concat | `training_utils/data.py:248-254` | Per-key `torch.cat(dim=0)` across samples in the microbatch |
 
-**Shape constraint:** the concat at data.py:248-254 assumes `[num_items, ...]`-shaped tensors. Stash activation vectors as `tensor[1, d_model]` (not `[d_model]`) so concat produces `[B, d_model]` per microbatch.
+**Shape constraint:** the concat at data.py:248-254 assumes `[num_items, ...]`-shaped tensors. Actor samples stash `tensor[1,K,d_model]`, so concat produces `[B,K,d_model]` per microbatch. Legacy/critic samples keep `tensor[1,d_model]` and concatenate to `[B,d_model]`.
 
 **The one gotcha:** `_get_model_inputs_args` (actor.py:634-635) spreads the dict directly into `model(**kwargs)`:
 ```python
 if batch.get("multimodal_train_inputs"):
     model_args.update(batch["multimodal_train_inputs"])
 ```
-Unknown kwargs like `nla_activation` → `TypeError: forward() got unexpected keyword argument`. **We override `_get_model_inputs_args` anyway** (§5 — that's where injection state is set), and popping the NLA keys before `model_args.update()` is one line.
+Unknown kwargs like `nla_activations` → `TypeError: forward() got unexpected keyword argument`. **We override `_get_model_inputs_args` anyway** (§5 — that's where injection state is set), and pop both plural and legacy singular NLA keys before `model_args.update()`.
 
 ### 3.3 What we stash
 
 **Actor modes (SFT + RL)** — fixed-shape only:
 ```python
 sample.multimodal_train_inputs = {
-    "nla_activation": torch.tensor(activation_vector, dtype=torch.float32).view(1, -1),  # [1, d_model]
+    "nla_activations": torch.tensor(activation_vectors, dtype=torch.float32).view(1, K, d_model),
 }
 ```
 
-After `get_batch`'s concat: `[B, d_model]`. This is the ONLY key the actor's hook needs.
+After `get_batch`'s concat: `[B,K,d_model]`. This is the only key the actor's hook needs. For legacy `K=1` RL, rollout also exposes `nla_activation: [1,d_model]` to the existing critic/reward path; joint bundles never synthesize that singular key.
 
 **RL mode additionally stashes for the critic** — variable-length, so **1-D**:
 ```python
@@ -214,7 +216,7 @@ The only assert-worthy case is at startup: first batch, 100% extraction failure 
 
 ### 4.1 Actor SFT (AV / decoder)
 
-**Data:** AV-SFT parquet: `prompt`, `response`, `activation_vector`. Token IDs (injection + neighbors) come from the sidecar, not per-row.
+**Data:** AV-SFT parquet: `prompt`, `response`, and either legacy `activation_vector` or ordered named checkpoint columns. Token IDs (injection + neighbors) come from the sidecar, not per-row.
 
 ```bash
 python train.py \
@@ -232,9 +234,9 @@ python train.py \
 
 | Step | Implementation |
 |---|---|
-| Dataset → `Sample` | `NLADataSource` with **`apply_chat_template=False`** — preserves `list[dict]` (AV-SFT's parquet `prompt` is messages). Substitute `<INJECT>` → `㊗` in the user message content HERE. `sample.prompt` = messages; `sample.metadata["response"]` = `<explanation>...</explanation>` string; `sample.metadata["activation_vector"]` = float list. |
-| Rollout | `nla.rollout.sft_actor`: **append `{"role":"assistant","content":response}` to `sample.prompt`**, call `MultiTurnLossMaskGenerator.get_loss_mask(messages)` (same pattern as `sft_rollout.py:49` — requires `list[dict]`). Stash `{"nla_activation": tensor[1,d_model]}` in `sample.multimodal_train_inputs`. **No SGLang.** |
-| Forward | Hook fires on embedding. `_get_model_inputs_args` pops `nla_activation` → `self._nla_vectors`. Hook scans `inputs[0]` for injection token (IDs from sidecar, loaded once in `init`). |
+| Dataset → `Sample` | `NLADataSource` preserves messages, checks exactly `K` placeholders, substitutes every `<INJECT>` → `㊗`, and stacks named columns in sidecar order as `sample.metadata["activation_vectors"]` `[K,d]`. Legacy K=1 also exposes `activation_vector`. |
+| Rollout | `nla.rollout.sft_actor` appends the assistant response, computes the loss mask, and stashes `{"nla_activations": tensor[1,K,d]}`. **No SGLang.** |
+| Forward | `_get_model_inputs_args` normalizes `[B,K,d]` independently along `d`; the hook flattens to `[B*K,d]` and maps row-major vectors to row-major prompt markers. |
 | Loss | Stock `sft_loss_function`. **Unchanged.** |
 
 ### 4.2 Critic SL (AR / encoder)
@@ -271,7 +273,15 @@ python train.py \
 
 ### 4.3 Actor RL (GRPO) + Online Critic
 
-**Data:** RL parquet: `prompt`, `activation_vector`. No `response`. Token IDs come from the sidecar.
+**Data:** legacy runnable RL uses `prompt`, `activation_vector`. Joint RL data can carry the named checkpoint columns, but is actor-side-only until the reconstruction objective is generalized. No `response`; token IDs come from the sidecar.
+
+> **Joint-checkpoint boundary:** joint RL actor generation/injection is wired,
+> but the current AR reward and critic loss still accept one `[B,d]` gold
+> vector. Do not launch joint-checkpoint RL until the multi-checkpoint
+> reconstruction objective is implemented. Legacy/single-checkpoint RL remains
+> unchanged.
+
+The remainder of this section describes that legacy single-checkpoint RL path.
 
 ```bash
 python train.py \
@@ -350,7 +360,7 @@ collective fires once per `--nla-reward-batch-size` instead of once per sample.
 |---|---|
 | `init()` | Critic role: rewire hf_checkpoint/save/lr, set `nla_model_is_critic`. Set `_is_critic_model`. Assert `cp_size==1`. Detect asymmetric DP (actor_dp!=critic_dp → stash `_nla_actor_dp` for `_repartition_for_critic`). Load `_nla_cfg` via `resolve_sidecar_source(args)`. Assert `d_model == hf_config.hidden_size`. Register injection hook (LM-actor only, on model + ref). |
 | `get_model_cls()` | `_is_critic_model` → `NLACriticModel` (K+1 layers from checkpoint's config.json). Else super. |
-| `_get_model_inputs_args()` | Pop `nla_activation` from multimodal dict. **Actor**: `normalize_activation(popped, injection_scale)` → `self._nla_vectors` (hook reads). **Critic**: stash RAW to `batch["nla_activation"]` + `batch["nla_mse_scale"]` (loss normalizes both sides). Per-microbatch, single state-setting point for both `_compute_log_prob` and `_train_step`. |
+| `_get_model_inputs_args()` | Pop actor `nla_activations` `[B,K,d]` and legacy/critic `nla_activation` `[B,d]`. **Actor**: normalize each checkpoint vector → `self._nla_vectors`. **Critic**: retain the singular RAW target in the batch. |
 | `_train_step()` | Critic branch: `values = self.model(...).values.float()` → `loss_function`. Else super. |
 | `train()` | Critic-model: `_swap_to_critic_tokens` (if `role=="critic"`) → `_train_critic_loop`. LM-actor: strip `nla_critic_tokens` from MM → `_train_core`. Wrapped in `timer` + `inverse_timer("train_wait")` + `log_perf_data_raw`. |
 | `save_model()` | Super (DCP). Then **all ranks** `get_model_state_dict` (COLLECTIVE — rank-0-only would deadlock). Rank-0: critic → `save_pretrained` to `iter_{rollout_id+1}/hf/` (matches checkpoint.py:199's +1 convention), both → `_write_sidecar`. Barrier. |
@@ -361,7 +371,7 @@ The only in-the-guts code. Miles' `_train_core` unconditionally calls `_compute_
 
 **Why scan inside the hook** instead of precomputing positions: miles reorders samples twice — once at `_split_train_data_by_dp` via `get_seqlen_balanced_partitions` (rollout.py:434), again at `get_data_iterator` for micro-batch balancing (training_utils/data.py:403). Then `get_batch` packs them into a fresh `cu_seqlens` stream per microbatch (data.py:163-167). Any position computed before these reorders is garbage. The hook's `inputs[0]` IS the exact `input_ids` the model sees — scan-by-token-ID there is correct by construction and padding-agnostic.
 
-**Vector→position mapping inside the hook:** after `get_batch`'s concat, `self._nla_vectors[i]` corresponds to the i-th sample *in microbatch order*. The packed token stream `inputs[0]` is also in microbatch order (same `torch.cat` iteration, data.py:167 + data.py:251). So iterating `matches` in seq-position order (`.nonzero()` returns sorted) and consuming `_nla_vectors` in order `[0, 1, 2, ...]` is correct. The count assertion catches any drift.
+**Vector→position mapping inside the hook:** after `get_batch`'s concat, the bundle is `[B,K,d]` in microbatch order and checkpoint order. The packed token stream is in the same sample order and each canonical prompt contains its `K` markers in checkpoint order. Flattening to `[B*K,d]`, then consuming row-major `.nonzero()` matches, is therefore correct. The global count assertion catches missing/extra markers before any write.
 
 **Why `_get_model_inputs_args`** for state setting: it's called exactly once per microbatch, immediately before `model(**args)`, in *both* `_compute_log_prob` (actor.py:351) and `_train_step` (actor.py:524). Overriding here covers both paths with one function. The v1 design's `_train_step` override was wrong for `_compute_log_prob` (which has its own internal micro-batch loop at actor.py:326-370 that v1's "set before loop, clear after" wrapping misses).
 
@@ -396,7 +406,7 @@ natural_language_autoencoders/
 │   │                               #   + resolve_sidecar_source (precedence: explicit > ckpt > dataset)
 │   ├── models.py                   # NLACriticModel: truncated transformer (K+1 layers from config.json),
 │   │                               #   no final LN (Identity swap), Linear(d,d) head, HF-compatible save/load
-│   ├── data_source.py              # NLADataSource: parquet → Sample, <INJECT>→㊗, raw activation_vector
+│   ├── data_source.py              # parquet → Sample; ordered raw [K,d] activation bundles
 │   ├── loss.py                     # nla_critic_loss — MSE at last-token pos, normalize BOTH to mse_scale (or raw)
 │   ├── train_actor.py              # NLAFSDPActor (§5) — hook, dispatch, critic-loop, save w/ sidecar
 │   ├── rollout/
@@ -431,4 +441,3 @@ natural_language_autoencoders/
 8. ✅ **Online critic** — `--force-use-critic` ON. Reward calls the live critic via Ray remote (`critic_fwd`), so it always uses current weights. This is the ONLY supported RL mode — frozen-critic was never implemented.
 
 ---
-

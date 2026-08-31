@@ -1,7 +1,8 @@
-"""Random-activation baseline — permute activation vectors across rows.
+"""Random-activation baseline — permute activation bundles across rows.
 
-Keeps prompts/responses/provenance fixed, shuffles ONLY the activation_vector
-column. If training on this gives the same MSE as the real dataset, the
+Keeps prompts/responses/provenance fixed, shuffles the legacy activation_vector
+or every named joint-checkpoint column with the SAME row permutation. If
+training on this gives the same MSE as the real dataset, the
 injection signal isn't doing anything (model ignores the vector). If MSE is
 much worse, the activation vector carries real information.
 
@@ -39,10 +40,18 @@ def main() -> None:
     in_meta = read_sidecar(storage, args.input)
 
     table = pq.read_table(storage.open_read(args.input))
-    assert "activation_vector" in table.column_names, (
-        f"input has no activation_vector column — not a stage3 output? "
-        f"Columns: {table.column_names}"
-    )
+    if "activation_vector" in table.column_names:
+        activation_columns = ["activation_vector"]
+    else:
+        activation_columns = [
+            checkpoint.column_name
+            for checkpoint in in_meta.extraction.checkpoints
+        ]
+        missing = [column for column in activation_columns if column not in table.column_names]
+        assert not missing, (
+            f"input is missing activation columns {missing}; not a compatible "
+            f"stage3 output? Columns: {table.column_names}"
+        )
 
     # Deterministic permutation keyed on (seed, dataset_id) — same input +
     # same seed → same shuffle, across environments.
@@ -52,16 +61,21 @@ def main() -> None:
     perm = list(range(table.num_rows))
     rng.shuffle(perm)
 
-    # Take the activation column in permuted order; leave everything else alone.
-    # Guard against the same silent uint32 byte-offset overflow stage_shuffle hit.
-    av_col = table.column("activation_vector")
-    if _values_nbytes(av_col) > _TAKE_VALUES_BYTES_LIMIT:
-        print(f"  activation_vector: {_values_nbytes(av_col) / 2**30:.2f} GiB — numpy gather")
-        shuffled_activations = _take_fixed_size_list_via_numpy(av_col, np.asarray(perm, dtype=np.int64))
-    else:
-        shuffled_activations = av_col.take(pa.array(perm, type=pa.int64()))
-    col_idx = table.column_names.index("activation_vector")
-    out_table = table.set_column(col_idx, "activation_vector", shuffled_activations)
+    # Apply one permutation to the whole checkpoint bundle. Independently
+    # shuffling columns would create combinations that never co-occurred in a
+    # target-model forward and would test a different baseline.
+    perm_np = np.asarray(perm, dtype=np.int64)
+    perm_pa = pa.array(perm, type=pa.int64())
+    out_table = table
+    for column in activation_columns:
+        av_col = table.column(column)
+        if _values_nbytes(av_col) > _TAKE_VALUES_BYTES_LIMIT:
+            print(f"  {column}: {_values_nbytes(av_col) / 2**30:.2f} GiB — numpy gather")
+            shuffled = _take_fixed_size_list_via_numpy(av_col, perm_np)
+        else:
+            shuffled = av_col.take(perm_pa)
+        col_idx = out_table.column_names.index(column)
+        out_table = out_table.set_column(col_idx, column, shuffled)
 
     storage.ensure_parent(args.output)
     pq.write_table(out_table, storage.open_write(args.output), row_group_size=65536)
@@ -75,7 +89,7 @@ def main() -> None:
         git_commit="",
     )
     write_sidecar(storage, args.output, out_meta)
-    print(f"shuffled activation_vector across {table.num_rows} rows → {args.output}")
+    print(f"shuffled {activation_columns} across {table.num_rows} rows → {args.output}")
     print(f"  (prompts/responses/provenance UNCHANGED — this is the random-baseline dataset)")
 
 

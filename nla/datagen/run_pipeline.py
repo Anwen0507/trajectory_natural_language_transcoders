@@ -18,8 +18,8 @@ from typing import Any
 
 import yaml
 
-from nla.datagen.model_presets import resolve as resolve_model_preset
-
+from nla.datagen.checkpoints import checkpoint_for_depth, checkpoints_for_depths
+from nla.datagen.model_presets import MODELS, resolve as resolve_model_preset
 
 _TRAIN_STAGES = ("av_sft", "ar_sft", "rl")
 
@@ -39,6 +39,17 @@ def _paths(output_dir: str) -> dict[str, str]:
         "ar_sft_shuf": f"{output_dir}/ar_sft_shuf.parquet",
         "rl_shuf": f"{output_dir}/rl_shuf.parquet",
     }
+
+
+def _training_path(
+    cfg: dict[str, Any], paths: dict[str, str], stage: str, depth: int | None, *, shuffled: bool = False
+) -> str:
+    if depth is None:
+        key = f"{stage}_shuf" if shuffled else stage
+        return paths[key]
+    checkpoint = checkpoint_for_depth(depth)
+    suffix = "_shuf" if shuffled else ""
+    return f"{cfg['output_dir']}/checkpoints/{checkpoint.name}/{stage}{suffix}.parquet"
 
 
 def _run(cmd: list[str]) -> None:
@@ -62,13 +73,16 @@ def _stage0(cfg: dict[str, Any], p: dict[str, str]) -> None:
         "--corpus-start", str(cfg["corpus"]["start"]),
         "--corpus-length", str(cfg["corpus"]["length"]),
         "--text-column", cfg["corpus"].get("text_column", "text"),
-        "--layer-index", str(cfg["layer_index"]),
         "--positions-per-doc", str(s0["positions_per_doc"]),
         "--chunk-size", str(s0["chunk_size"]),
         "--seed", str(s0["seed"]),
         "--output", p["base"],
         *_storage_args(cfg),
     ]
+    if "checkpoint_depths" in cfg:
+        common += ["--checkpoint-depths", *map(str, cfg["checkpoint_depths"])]
+    else:
+        common += ["--layer-index", str(cfg["layer_index"])]
     if cfg["corpus"].get("config"):
         common += ["--corpus-config", cfg["corpus"]["config"]]
     if s0.get("extractor_kwargs"):
@@ -121,22 +135,59 @@ def _stage3(cfg: dict[str, Any], p: dict[str, str]) -> None:
     s3 = cfg["stage3"]
     debug_flag = "--keep-debug-metadata" if s3["keep_debug_metadata"] else "--no-keep-debug-metadata"
     storage = _storage_args(cfg)
-    _run([sys.executable, "-m", "nla.datagen.stage3_build",
-          "--input", p["av_sft_explained"], "--stage", "av_sft", "--output", p["av_sft"], debug_flag, *storage])
-    _run([sys.executable, "-m", "nla.datagen.stage3_build",
-          "--input", p["ar_sft_explained"], "--stage", "ar_sft", "--output", p["ar_sft"], debug_flag, *storage])
-    _run([sys.executable, "-m", "nla.datagen.stage3_build",
-          "--input", p["rl_raw"], "--stage", "rl", "--output", p["rl"], debug_flag, *storage])
+    inputs = {
+        "av_sft": p["av_sft_explained"],
+        "ar_sft": p["ar_sft_explained"],
+        "rl": p["rl_raw"],
+    }
+    critic_template_args: list[str] = []
+    if s3.get("critic_template") is not None:
+        critic_template_args += ["--critic-template", s3["critic_template"]]
+
+    if "checkpoint_depths" in cfg:
+        # AV inputs are joint bundles. AR remains one dataset/model per
+        # checkpoint until the multi-checkpoint reconstruction objective lands.
+        targets = [("av_sft", None), ("rl", None)] + [
+            ("ar_sft", depth) for depth in cfg["checkpoint_depths"]
+        ]
+    else:
+        targets = [(stage, None) for stage in _TRAIN_STAGES]
+
+    for stage, depth in targets:
+        selection = ["--checkpoint-depth", str(depth)] if depth is not None else []
+        # A joint actor template has K placeholders, while each selected AR
+        # sidecar must retain a one-site actor template. Let Stage 3 generate
+        # that selected default instead of passing the incompatible joint one.
+        actor_template_args = []
+        if s3.get("actor_template") is not None and depth is None:
+            actor_template_args = ["--actor-template", s3["actor_template"]]
+        _run([
+            sys.executable, "-m", "nla.datagen.stage3_build",
+            "--input", inputs[stage],
+            "--stage", stage,
+            "--output", _training_path(cfg, p, stage, depth),
+            *selection,
+            *actor_template_args,
+            *critic_template_args,
+            debug_flag,
+            *storage,
+        ])
 
 
 def _shuffle(cfg: dict[str, Any], p: dict[str, str]) -> None:
     sh = cfg["shuffle"]
     storage = _storage_args(cfg)
-    for side in _TRAIN_STAGES:
+    if "checkpoint_depths" in cfg:
+        targets = [("av_sft", None), ("rl", None)] + [
+            ("ar_sft", depth) for depth in cfg["checkpoint_depths"]
+        ]
+    else:
+        targets = [(stage, None) for stage in _TRAIN_STAGES]
+    for side, depth in targets:
         _run([
             sys.executable, "-m", "nla.datagen.stage_shuffle",
-            "--input", p[side],
-            "--output", p[f"{side}_shuf"],
+            "--input", _training_path(cfg, p, side, depth),
+            "--output", _training_path(cfg, p, side, depth, shuffled=True),
             "--seed", str(sh["seed"]),
             *storage,
         ])
@@ -155,7 +206,7 @@ def main() -> None:
                     help="dotted-key overrides, e.g. 'corpus.start=25000 output_dir=/tmp/n1'")
     args = ap.parse_args()
 
-    cfg = resolve_model_preset(yaml.safe_load(Path(args.config).read_text()))
+    cfg = yaml.safe_load(Path(args.config).read_text())
     for ov in args.override:
         key, _, val = ov.partition("=")
         d = cfg
@@ -163,6 +214,18 @@ def main() -> None:
         for k in path:
             d = d.setdefault(k, {})
         d[leaf] = yaml.safe_load(val)
+    cfg = resolve_model_preset(cfg)
+    has_layer = cfg.get("layer_index") is not None
+    has_checkpoints = cfg.get("checkpoint_depths") is not None
+    assert has_layer != has_checkpoints, (
+        "config must set exactly one of layer_index or checkpoint_depths"
+    )
+    if has_checkpoints:
+        preset = MODELS.get(cfg.get("model"))
+        checkpoints_for_depths(
+            cfg["checkpoint_depths"],
+            num_layers=preset.num_layers if preset is not None else None,
+        )
     p = _paths(cfg["output_dir"])
 
     if args.stages is None:
@@ -175,20 +238,41 @@ def main() -> None:
         assert s in _STAGES, f"unknown stage {s!r}, valid: {sorted(_STAGES)}"
 
     print(f"=== pipeline: {args.config} → {cfg['output_dir']} ===")
-    print(f"    base_model={cfg['base_model']} layer={cfg['layer_index']}")
-    print(f"    corpus={cfg['corpus']['name']} docs={cfg['corpus']['length']} positions/doc={cfg['stage0']['positions_per_doc']}")
-    print(f"    split={cfg['stage1']['av_sft_frac']}/{cfg['stage1']['ar_sft_frac']}/{cfg['stage1']['rl_frac']}")
+    target = (
+        f"checkpoint_depths={cfg['checkpoint_depths']}"
+        if "checkpoint_depths" in cfg
+        else f"layer={cfg['layer_index']}"
+    )
+    print(f"    base_model={cfg['base_model']} {target}")
+    print(
+        f"    corpus={cfg['corpus']['name']} docs={cfg['corpus']['length']} "
+        f"positions/doc={cfg['stage0']['positions_per_doc']}"
+    )
+    print(
+        f"    split={cfg['stage1']['av_sft_frac']}/"
+        f"{cfg['stage1']['ar_sft_frac']}/{cfg['stage1']['rl_frac']}"
+    )
     print(f"    stages={stages}")
 
     for s in stages:
         print(f"\n{'='*20} STAGE {s} {'='*20}")
         _STAGES[s](cfg, p)
 
-    print(f"\n=== done ===")
-    suffix = "_shuf" if "shuffle" in stages else ""
-    final_paths = [p[k + suffix] for k in _TRAIN_STAGES]
-    for k, fp in zip(_TRAIN_STAGES, final_paths, strict=True):
-        print(f"  {k}: {fp}")
+    print("\n=== done ===")
+    shuffled = "shuffle" in stages
+    if "checkpoint_depths" in cfg:
+        final_targets = [(None, "av_sft"), (None, "rl")] + [
+            (depth, "ar_sft") for depth in cfg["checkpoint_depths"]
+        ]
+    else:
+        final_targets = [(None, stage) for stage in _TRAIN_STAGES]
+    final_outputs = [
+        (depth, stage, _training_path(cfg, p, stage, depth, shuffled=shuffled))
+        for depth, stage in final_targets
+    ]
+    for depth, stage, output_path in final_outputs:
+        checkpoint_label = "" if depth is None else f"/{checkpoint_for_depth(depth).name}"
+        print(f"  {stage}{checkpoint_label}: {output_path}")
 
     upload = cfg.get("upload")
     if upload:
@@ -199,7 +283,11 @@ def main() -> None:
         # always present in explained regardless of keep_debug_metadata).
         mod, _, name = upload["fn"].rpartition(".")
         upload_fn = getattr(importlib.import_module(mod), name)
-        to_upload = [f for fp in final_paths for f in (fp, f"{fp}.nla_meta.yaml")]
+        to_upload = [
+            path
+            for _, _, output_path in final_outputs
+            for path in (output_path, f"{output_path}.nla_meta.yaml")
+        ]
         for side in ("av_sft", "ar_sft"):
             to_upload += [p[f"{side}_explained"], f"{p[f'{side}_explained']}.nla_meta.yaml"]
         upload_fn(to_upload, upload["subdir"])

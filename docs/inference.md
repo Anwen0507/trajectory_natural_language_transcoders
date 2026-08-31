@@ -3,11 +3,13 @@
 Standalone inference client + recipe for NLA (Natural Language Autoencoder) models.
 
 An **NLA pair** is two fine-tuned LMs that together map activation vectors to
-natural language and back:
+natural language and back. The AV can consume an ordered bundle of `K`
+checkpoints; the currently implemented AR and round-trip score remain
+single-checkpoint:
 
 | | direction | mechanism |
 |---|---|---|
-| **AV** (Activation Verbaliser) | `vector → text` | inject vector as a 1-token embedding into a fixed prompt, autoregress |
+| **AV** (Activation Verbaliser) | `vectors → text` | inject `K` vectors at `K` marked token embeddings in a fixed prompt, autoregress |
 | **AR** (Activation Reconstructor) | `text → vector` | truncated K+1-layer LM + Linear(d,d) head, extract at final token |
 
 The round-trip **MSE(reconstructed, original)** measures how well the
@@ -33,11 +35,10 @@ direction from the AV's words alone.
 
 ## What an NLA AV is
 
-A causal LM fine-tuned so that when you overwrite **one token embedding** in
-its prompt with an arbitrary `[d_model]` vector, it generates a
-natural-language description of that vector. The vector is typically a hidden
-state extracted from another model's residual stream, but the AV doesn't
-care where it came from — any `[d_model]` float vector works.
+A causal LM fine-tuned so that when you overwrite `K` marked token embeddings
+in its prompt with an ordered `[K,d_model]` checkpoint bundle, it generates a
+natural-language description of their joint content. A legacy single-checkpoint
+AV is the `K=1` case and still accepts a flat `[d_model]` vector.
 
 ---
 
@@ -61,6 +62,9 @@ tokenizer at startup. Schema (only the fields inference needs):
 kind: nla_model
 d_model: 3584                          # Qwen7B. Gemma-3-12B: 3840
 extraction:
+  checkpoints:                       # canonical bundle and prompt-site order
+    - {name: embedding, depth: 0}
+    - {name: block_24, depth: 24}
   injection_scale: 150.0               # L2-norm vectors get rescaled to before injection.
                                        # Qwen7B: 150. Gemma-3-12B: 80000.
 tokens:
@@ -70,13 +74,10 @@ tokens:
   injection_right_neighbor_id: 522     # the `>` of `<concept>` and `<` of `</concept>`
 prompt_templates:
   av: |-
-    You are a meticulous AI researcher conducting an important investigation into activation vectors from a language model. Your overall task is to describe the semantic content of that activation vector.
+    Here are the checkpoint vectors:
 
-    We will pass the vector enclosed in <concept> tags into your context. You must then produce an explanation for the vector, enclosed within <explanation> tags. The explanation consists of 2-3 text snippets describing that vector.
-
-    Here is the vector:
-
-    <concept>{injection_char}</concept>
+    Embedding checkpoint: <concept>{injection_char}</concept>
+    Block 24 checkpoint: <concept>{injection_char}</concept>
 
     Please provide an explanation.
 ```
@@ -117,21 +118,28 @@ Load the embedding weight directly from safetensors
 `safetensors.safe_open` reads one tensor lazily; ~2s vs ~30s for the full
 12B model.
 
-### 3. Rescale the activation vector, inject
+The template must contain exactly `K` `{injection_char}` fields, in the same
+order as `extraction.checkpoints`. All sites use the same rare single-token
+sentinel and the same immediate neighbors.
+
+### 3. Rescale each activation vector, inject in scan order
 
 ```python
-v_scaled = v_raw * (cfg.injection_scale / ||v_raw||_fp32)
+v_scaled = v_raw * (cfg.injection_scale / ||v_raw||_fp32)  # per row, [K,d]
 
-# Find injection position: scan for token ID, verify neighbors
+# Find all K positions: scan for token ID, verify neighbors, then zip in order
+positions = []
 for p in [i for i, t in enumerate(input_ids) if t == cfg.injection_token_id]:
     if input_ids[p-1] == cfg.left_neighbor_id and input_ids[p+1] == cfg.right_neighbor_id:
-        embeds[0, p] = v_scaled
-        break
+        positions.append(p)
+assert len(positions) == len(v_scaled)
+for p, vector in zip(positions, v_scaled):
+    embeds[0, p] = vector
 ```
 
-**`injection_scale` is mandatory.** The model was trained with vectors at
-this exact L2-norm. Raw-magnitude vectors are out-of-distribution and output
-degrades badly.
+**`injection_scale` is mandatory.** The model was trained with each vector at
+this exact L2-norm. Normalize independently along the last dimension;
+normalizing the flattened bundle would couple checkpoint magnitudes.
 
 **Neighbor check is mandatory.** The injection char is rare but not
 guaranteed unique (user pasted it, multi-turn context). The `<concept>`

@@ -1,11 +1,13 @@
 """NLA actor inference via SGLang input_embeds — single-file, no nla package deps.
 
 An NLA (Natural Language Autoencoder) pair is two fine-tuned LMs that together
-map activation vectors to natural language and back:
+map activation vectors to natural language and back. The actor can inject an
+ordered bundle of K checkpoints into K prompt positions; the existing critic
+and round-trip score remain single-checkpoint:
 
-  ACTOR  (activation verbalizer)  : hidden-state vector  →  text
-                                    [inject vector as a 1-token embedding
-                                     into a fixed prompt, then autoregress]
+  ACTOR  (activation verbalizer)  : checkpoint vectors  →  text
+                                    [inject K vectors at K marked token
+                                     embeddings, then autoregress]
 
   CRITIC (activation reconstructor): text  →  hidden-state vector
                                     [truncated K+1-layer LM + Linear(d,d)
@@ -61,15 +63,16 @@ Launch SGLang first (same checkpoint path as NLAClient below):
 
 Usage:
     client = NLAClient("./actor_hf", sglang_url="http://localhost:30000")
-    text = client.generate(activation_vector)    # activation: [d_model] array
+    text = client.generate(activation_bundle)  # [K, d_model] in sidecar order
+    # Legacy K=1 actors also accept a flat [d_model] vector.
 
-    # or batched — one SGLang request per vector; SGLang's continuous batcher
+    # or batched — one SGLang request per bundle; SGLang's continuous batcher
     # packs them server-side. For real throughput, fire in parallel via
     # async httpx.
     texts = client.generate_batch(vectors, temperature=0.7)
 
-    # custom prompt (must contain <INJECT> where the vector goes):
-    text = client.generate(v, prompt="What is: <concept><INJECT></concept>?")
+    # A custom prompt must contain exactly K <INJECT> sites in checkpoint order.
+    text = client.generate(bundle, prompt="Early: <concept><INJECT></concept>\nLate: <concept><INJECT></concept>")
 """
 
 from __future__ import annotations
@@ -111,10 +114,16 @@ class NLAConfig:
     injection_left_neighbor_id: int
     injection_right_neighbor_id: int
     actor_prompt_template: str
+    activation_checkpoint_names: tuple[str, ...]
+    activation_checkpoint_depths: tuple[int | None, ...]
     # L2-norm the vector gets rescaled to before injection. MANDATORY — the
     # model learned with this exact scale; raw-magnitude vectors are OOD.
     # Qwen7B: 150. Gemma-3-12B: 80000 (√d embed scaling inflates residual norms).
     injection_scale: float
+
+    @property
+    def num_injection_sites(self) -> int:
+        return len(self.activation_checkpoint_names)
 
 
 def load_nla_config(
@@ -155,6 +164,27 @@ def load_nla_config(
         f"injection_scale_override explicitly."
     )
 
+    extraction = meta.get("extraction", {})
+    checkpoint_dicts = extraction.get("checkpoints") or []
+    if checkpoint_dicts:
+        checkpoint_names = tuple(checkpoint["name"] for checkpoint in checkpoint_dicts)
+        checkpoint_depths = tuple(checkpoint.get("depth") for checkpoint in checkpoint_dicts)
+        assert len(set(checkpoint_names)) == len(checkpoint_names), (
+            f"duplicate activation checkpoint names: {checkpoint_names}"
+        )
+        known_depths = [depth for depth in checkpoint_depths if depth is not None]
+        assert known_depths == sorted(set(known_depths)), (
+            "activation checkpoint depths must be sorted and unique; "
+            f"got {checkpoint_depths}"
+        )
+    else:
+        layer_index = extraction.get("layer_index")
+        depth = layer_index + 1 if layer_index is not None else None
+        checkpoint_names = (
+            f"block_{depth:02d}" if depth is not None else "activation",
+        )
+        checkpoint_depths = (depth,)
+
     t = meta["tokens"]
     cfg = NLAConfig(
         d_model=d_model,
@@ -164,6 +194,8 @@ def load_nla_config(
         injection_right_neighbor_id=t["injection_right_neighbor_id"],
         actor_prompt_template=meta["prompt_templates"].get("av")
                               or meta["prompt_templates"]["actor"],
+        activation_checkpoint_names=checkpoint_names,
+        activation_checkpoint_depths=checkpoint_depths,
         injection_scale=float(inj_scale),
     )
 
@@ -189,20 +221,20 @@ def load_nla_config(
         tokenize=True, add_generation_prompt=True,
     )
     matches = [i for i, tok in enumerate(ids) if tok == cfg.injection_token_id]
-    assert len(matches) == 1, (
+    assert len(matches) == cfg.num_injection_sites, (
         f"injection token appears {len(matches)}× in canonical prompt "
-        f"(expected 1). Template: {content!r}"
+        f"(expected {cfg.num_injection_sites}). Template: {content!r}"
     )
-    p = matches[0]
-    assert 0 < p < len(ids) - 1
-    assert ids[p - 1] == cfg.injection_left_neighbor_id, (
-        f"left neighbor drift: {ids[p-1]} vs sidecar "
-        f"{cfg.injection_left_neighbor_id}"
-    )
-    assert ids[p + 1] == cfg.injection_right_neighbor_id, (
-        f"right neighbor drift: {ids[p+1]} vs sidecar "
-        f"{cfg.injection_right_neighbor_id}"
-    )
+    for p in matches:
+        assert 0 < p < len(ids) - 1
+        assert ids[p - 1] == cfg.injection_left_neighbor_id, (
+            f"left neighbor drift at position {p}: {ids[p-1]} vs sidecar "
+            f"{cfg.injection_left_neighbor_id}"
+        )
+        assert ids[p + 1] == cfg.injection_right_neighbor_id, (
+            f"right neighbor drift at position {p}: {ids[p+1]} vs sidecar "
+            f"{cfg.injection_right_neighbor_id}"
+        )
 
     return cfg
 
@@ -308,19 +340,20 @@ def inject_at_marked_positions(
     assert vectors.ndim == 2 and vectors.shape[1] == embeddings.shape[-1]
     out = embeddings.clone()
     vectors = vectors.to(out.device, out.dtype)
-    vec_idx = 0
+    valid_matches = []
     for b, p in (input_ids == inj_id).nonzero().tolist():
         if p == 0 or p == seq_len - 1:
             continue
         if input_ids[b, p - 1] != left_id or input_ids[b, p + 1] != right_id:
             continue
-        out[b, p] = vectors[vec_idx]
-        vec_idx += 1
-    assert vec_idx == vectors.shape[0], (
-        f"found {vec_idx} injection sites with correct neighbors, expected "
+        valid_matches.append((b, p))
+    assert len(valid_matches) == vectors.shape[0], (
+        f"found {len(valid_matches)} injection sites with correct neighbors, expected "
         f"{vectors.shape[0]}. Template drift, tokenizer mismatch, or prompt "
         f"missing the injection marker."
     )
+    for vec_idx, (b, p) in enumerate(valid_matches):
+        out[b, p] = vectors[vec_idx]
     return out
 
 
@@ -368,6 +401,7 @@ class NLAClient:
         print(
             f"[NLAClient] {checkpoint_dir.name}: d_model={self.cfg.d_model} "
             f"inj_scale={self.cfg.injection_scale} embed_scale={self.embed_scale:.2f} "
+            f"sites={self.cfg.num_injection_sites} "
             f"inj_char={self.cfg.injection_char!r}(id={self.cfg.injection_token_id})"
         )
 
@@ -378,7 +412,8 @@ class NLAClient:
     ) -> tuple[np.ndarray, int]:
         """Tokenize → embed → arch-scale → inject. Returns (embeds[T,d], prompt_len).
 
-        prompt_content: user message content WITH <INJECT> placeholder. None
+        v_raw: [K, d_model] in sidecar checkpoint order.
+        prompt_content: user message content WITH K <INJECT> placeholders. None
         uses the sidecar's canonical actor template (recommended — that's
         what the model was trained on).
         """
@@ -387,8 +422,10 @@ class NLAClient:
                 injection_char=self.cfg.injection_char
             )
         else:
-            assert INJECT_PLACEHOLDER in prompt_content, (
-                f"custom prompt must contain {INJECT_PLACEHOLDER!r}"
+            marker_count = prompt_content.count(INJECT_PLACEHOLDER)
+            assert marker_count == self.cfg.num_injection_sites, (
+                f"custom prompt contains {marker_count} {INJECT_PLACEHOLDER!r} "
+                f"markers, expected {self.cfg.num_injection_sites}"
             )
             content = prompt_content.replace(
                 INJECT_PLACEHOLDER, self.cfg.injection_char
@@ -414,11 +451,11 @@ class NLAClient:
 
         assert torch.isfinite(v_raw).all(), "activation has NaN/Inf"
         v_scaled = normalize_activation(
-            v_raw.float().view(1, -1), self.cfg.injection_scale
+            v_raw.float(), self.cfg.injection_scale
         )
 
         injected = inject_at_marked_positions(
-            ids_t, embeds.cpu(), v_scaled,
+            ids_t, embeds.cpu(), v_scaled.reshape(-1, self.cfg.d_model),
             self.cfg.injection_token_id,
             self.cfg.injection_left_neighbor_id,
             self.cfg.injection_right_neighbor_id,
@@ -460,10 +497,12 @@ class NLAClient:
         extract_explanation: bool = True,
         **sampling: object,
     ) -> str:
-        """Decode one activation vector.
+        """Decode an ordered activation-checkpoint bundle.
 
-        activation:  [d_model] raw vector — rescaled to cfg.injection_scale.
-        prompt:      user-message content with <INJECT> marker. Default (None)
+        activation:  [K, d_model] raw vectors in sidecar checkpoint order.
+                     Legacy K=1 clients may pass [d_model]. Each vector is
+                     independently rescaled to cfg.injection_scale.
+        prompt:      user-message content with K <INJECT> markers. Default (None)
                      uses the sidecar's actor template — RECOMMENDED.
         extract_explanation:  strip <explanation> tags. False returns raw gen
                      (useful for debugging — if ALL outputs are CJK, or
@@ -479,8 +518,13 @@ class NLAClient:
           Seen during training but rare — unsurprising if decode is poor.
         """
         v = torch.as_tensor(np.asarray(activation, dtype=np.float32))
-        assert v.numel() == self.cfg.d_model, (
-            f"activation length {v.numel()} != d_model {self.cfg.d_model}"
+        if v.ndim == 1 and self.cfg.num_injection_sites == 1:
+            v = v.unsqueeze(0)
+        expected_shape = (self.cfg.num_injection_sites, self.cfg.d_model)
+        assert tuple(v.shape) == expected_shape, (
+            f"activation bundle shape {tuple(v.shape)} != expected "
+            f"{expected_shape} for checkpoints "
+            f"{self.cfg.activation_checkpoint_names}"
         )
 
         embeds_np, _ = self._build_embeds(v, prompt)
@@ -668,8 +712,8 @@ class NLACritic:
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 def _main() -> None:
-    """Feed vectors from a parquet's activation_vector column, or smoke-test
-    with one random vector. ALL outputs in CJK (or English describing a CJK
+    """Feed activation bundles from parquet, or smoke-test with random vectors.
+    ALL outputs in CJK (or English describing a CJK
     char)? Injection likely failed — see README §Debugging."""
     import argparse
 
@@ -677,8 +721,9 @@ def _main() -> None:
     ap.add_argument("checkpoint", help="HF-format NLA actor dir (with nla_meta.yaml)")
     ap.add_argument("--sglang-url", default="http://localhost:30000")
     ap.add_argument("--parquet", default=None,
-                    help="Parquet with activation_vector column. Default: "
-                         "smoke-test with one random vector.")
+                    help="Parquet with activation_vector (legacy) or the named "
+                         "checkpoint columns recorded in the actor sidecar. "
+                         "Default: smoke-test with random vectors.")
     ap.add_argument("--n", type=int, default=3, help="rows to sample from parquet")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--max-new-tokens", type=int, default=200)
@@ -699,8 +744,10 @@ def _main() -> None:
     )
 
     if args.parquet is None:
-        print("[smoke] No parquet — generating for one random unit vector.")
-        v = np.random.randn(client.cfg.d_model).astype(np.float32)
+        print("[smoke] No parquet — generating one random checkpoint bundle.")
+        v = np.random.randn(
+            client.cfg.num_injection_sites, client.cfg.d_model
+        ).astype(np.float32)
         out = client.generate(
             v, prompt=args.prompt,
             temperature=args.temperature, max_new_tokens=args.max_new_tokens,
@@ -711,11 +758,31 @@ def _main() -> None:
 
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(args.parquet)
-    batch = next(pf.iter_batches(batch_size=args.n, columns=["activation_vector"]))
-    # flatten→reshape avoids to_pylist()'s O(n×d) Python-float creation
-    flat = batch.column("activation_vector").flatten().to_numpy(
-        zero_copy_only=False).astype(np.float32)
-    vecs = flat.reshape(len(batch), -1)
+    available = pf.schema_arrow.names
+    if "activation_vector" in available:
+        assert client.cfg.num_injection_sites == 1, (
+            "parquet has one activation_vector column, but actor expects "
+            f"{client.cfg.num_injection_sites} checkpoint sites"
+        )
+        activation_columns = ["activation_vector"]
+    else:
+        activation_columns = [
+            f"activation_{name}"
+            for name in client.cfg.activation_checkpoint_names
+        ]
+        missing = [column for column in activation_columns if column not in available]
+        assert not missing, (
+            f"parquet missing actor checkpoint columns {missing}; available: {available}"
+        )
+    batch = next(pf.iter_batches(batch_size=args.n, columns=activation_columns))
+    # flatten→reshape avoids to_pylist()'s O(n×K×d) Python-float creation.
+    matrices = []
+    for column in activation_columns:
+        flat = batch.column(column).flatten().to_numpy(
+            zero_copy_only=False
+        ).astype(np.float32)
+        matrices.append(flat.reshape(len(batch), client.cfg.d_model))
+    vecs = np.stack(matrices, axis=1)
 
     for i, v in enumerate(vecs):
         out = client.generate(
@@ -723,7 +790,8 @@ def _main() -> None:
             temperature=args.temperature, max_new_tokens=args.max_new_tokens,
             extract_explanation=not args.raw,
         )
-        print(f"─── [{i}]  ||v||={np.linalg.norm(v):.1f} ─────────────────────")
+        norms = ", ".join(f"{norm:.1f}" for norm in np.linalg.norm(v, axis=-1))
+        print(f"─── [{i}]  checkpoint ||v||=[{norms}] ──────────")
         print(out)
         print()
 

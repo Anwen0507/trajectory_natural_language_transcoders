@@ -20,13 +20,16 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
-
 from miles.rollout.data_source import RolloutDataSource
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.types import Sample
 
 from nla.config import load_nla_config, resolve_sidecar_source
-from nla.schema import INJECT_PLACEHOLDER
+from nla.schema import (
+    ACTIVATION_COLUMN,
+    ACTIVATIONS_KEY,
+    INJECT_PLACEHOLDER,
+)
 from nla.storage import fetch_to_local_cache, is_remote
 
 
@@ -66,12 +69,16 @@ class NLADataSource(RolloutDataSource):
             tokenizer,
         )
         inj_char = nla_cfg.injection_char
+        checkpoint_names = tuple(
+            getattr(nla_cfg, "activation_checkpoint_names", ("activation",))
+        )
+        expected_sites = len(checkpoint_names)
 
         # CRITICAL: miles' read_file does batch.to_pylist() which creates a Python
-        # list[float] per activation_vector. 500k × 3584 = 1.8B PyFloat objects →
-        # hangs the load for 10+ minutes + pollutes GC. Read activation_vector as
-        # pure numpy (flatten→reshape, zero Python-object intermediate); read other
-        # columns via to_pylist (they're small — strings/ints).
+        # list[float] per activation column. 500k × 3584 = 1.8B PyFloat objects
+        # per checkpoint → hangs the load for 10+ minutes + pollutes GC. Read
+        # activation columns as pure numpy (flatten→reshape, zero Python-object
+        # intermediate); read other columns via to_pylist (small strings/ints).
         t0 = time.perf_counter()
         assert "@[" not in args.prompt_data, (
             f"NLADataSource does not honor the @[start:end] slice syntax "
@@ -81,24 +88,50 @@ class NLADataSource(RolloutDataSource):
         parquet_path = args.prompt_data
         pf = pq.ParquetFile(parquet_path)
         cols = pf.schema_arrow.names
-        assert "activation_vector" in cols, f"parquet {parquet_path!r} missing activation_vector column"
-        other_cols = [c for c in cols if c != "activation_vector"]
+        if ACTIVATION_COLUMN in cols:
+            assert expected_sites == 1, (
+                f"parquet {parquet_path!r} has legacy {ACTIVATION_COLUMN!r}, but "
+                f"sidecar declares {expected_sites} checkpoints: {checkpoint_names}"
+            )
+            activation_cols = [ACTIVATION_COLUMN]
+        else:
+            activation_cols = [f"activation_{name}" for name in checkpoint_names]
+            missing = [column for column in activation_cols if column not in cols]
+            assert not missing, (
+                f"parquet {parquet_path!r} missing joint activation columns {missing}; "
+                f"sidecar order is {checkpoint_names}, available columns: {cols}"
+            )
+        activation_col_set = set(activation_cols)
+        other_cols = [c for c in cols if c not in activation_col_set]
 
         samples = []
         for batch in pf.iter_batches(batch_size=16384):
-            # activation_vector: ListArray → flat numpy → reshape. Zero Python objects.
-            av_col = batch.column("activation_vector")
-            av_flat = av_col.flatten().to_numpy(zero_copy_only=False).astype(np.float32)
-            av = av_flat.reshape(len(av_col), -1)
+            # FixedSizeList columns → [rows, K, d] numpy.  No Python floats;
+            # checkpoint axis follows the sidecar's canonical order.
+            activation_matrices = []
+            for column in activation_cols:
+                av_col = batch.column(column)
+                av_flat = av_col.flatten().to_numpy(zero_copy_only=False).astype(np.float32)
+                activation_matrices.append(av_flat.reshape(len(av_col), -1))
+            av = np.stack(activation_matrices, axis=1)
+            assert av.shape[1] == expected_sites and av.shape[2] == nla_cfg.d_model, (
+                f"activation bundle has shape {av.shape}, expected "
+                f"[rows, {expected_sites}, {nla_cfg.d_model}]"
+            )
             # other columns via to_pylist — small (prompts, strings, ints)
             rest = batch.select(other_cols).to_pylist()
 
             for i, (row, vec) in enumerate(zip(rest, av, strict=True)):
                 prompt = row[args.input_key]
                 if isinstance(prompt, list):
-                    assert any(INJECT_PLACEHOLDER in m.get("content", "") for m in prompt), (
-                        f"row {len(samples)+i}: no message contains {INJECT_PLACEHOLDER!r}. "
-                        f"List-prompts must have the injection marker in user content."
+                    marker_count = sum(
+                        m.get("content", "").count(INJECT_PLACEHOLDER)
+                        for m in prompt
+                    )
+                    assert marker_count == expected_sites, (
+                        f"row {len(samples)+i}: prompt contains {marker_count} "
+                        f"{INJECT_PLACEHOLDER!r} markers, expected {expected_sites} "
+                        f"for checkpoints {checkpoint_names}."
                     )
                     prompt = [
                         {**msg, "content": msg["content"].replace(INJECT_PLACEHOLDER, inj_char)}
@@ -109,10 +142,16 @@ class NLADataSource(RolloutDataSource):
                         f"row {len(samples)+i}: prompt must be list[dict] or str, got {type(prompt).__name__}"
                     )
 
-                sample_meta: dict[str, object] = {"activation_vector": vec}
+                sample_meta: dict[str, object] = {ACTIVATIONS_KEY: vec}
+                # Legacy critic/reward code consumes a single [d] vector. Keep
+                # that contract only when K=1; never silently select one vector
+                # from a joint bundle.
+                if expected_sites == 1:
+                    sample_meta[ACTIVATION_COLUMN] = vec[0]
                 if "response" in row:
                     sample_meta["response"] = row["response"]
                 for k in ("n_raw_tokens", "detokenized_text_truncated",
+                          "activation_checkpoint", "activation_depth",
                           "activation_layer", "doc_id", "sample_uuid"):
                     if k in row:
                         sample_meta[k] = row[k]

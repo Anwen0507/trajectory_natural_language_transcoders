@@ -1,8 +1,9 @@
-# Quick end-to-end verification — 10 docs, tiny model, single GPU.
-# Tests the full stage0→1→2→3 pipeline before committing to a real 100k run.
+# Quick multi-checkpoint end-to-end verification — 10 docs, tiny model, single GPU.
+# One forward captures embedding + every four-block boundary. Stage 3 writes
+# joint AV/RL files at the root and one AR file under checkpoints/{name}/.
 
-base_model: Qwen/Qwen2.5-0.5B-Instruct
-layer_index: 10
+model: qwen05b
+checkpoint_depths: [0, 4, 8, 12, 16, 20, 24]
 output_dir: /tmp/nla_quick_test
 
 corpus:

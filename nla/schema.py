@@ -53,8 +53,14 @@ def extract_explanation(response: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
-# Parquet column name — datagen writes it, NLADataSource + rollouts read it.
+# Legacy/single-checkpoint parquet column name — datagen writes it,
+# NLADataSource + critic rollouts read it.
 ACTIVATION_COLUMN = "activation_vector"
+
+# Joint-checkpoint Sample.metadata key.  Joint parquets keep one named Arrow
+# column per checkpoint (activation_embedding, activation_block_04, ...), then
+# NLADataSource stacks those columns in sidecar order into [K, d_model].
+ACTIVATIONS_KEY = "activation_vectors"
 
 # Placeholder in parquet prompt column — datagen writes <INJECT> literal,
 # NLADataSource swaps it for the injection char at load time.
@@ -63,6 +69,11 @@ INJECT_PLACEHOLDER = "<INJECT>"
 # multimodal_train_inputs dict keys — rollouts stash, train_actor + loss read.
 # String typo here = silent KeyError deep in training.
 MM_ACTIVATION_KEY = "nla_activation"
+# Actor-only joint-checkpoint bundle.  Per sample this is [1, K, d_model];
+# miles concatenates it into [B, K, d_model].  Keep it distinct from the
+# singular critic key above so the existing AR/loss path cannot accidentally
+# consume a rank-3 gold tensor.
+MM_ACTIVATIONS_KEY = "nla_activations"
 MM_CRITIC_TOKENS_KEY = "nla_critic_tokens"
 MM_MSE_SCALE_KEY = "nla_mse_scale"
 
@@ -205,8 +216,9 @@ def compute_canonical_neighbors(
     actor_template: str,
     injection_char: str,
     injection_token_id: int,
+    expected_count: int = 1,
 ) -> tuple[int, int]:
-    """Tokenize the canonical actor prompt, return token IDs at inj_pos ± 1.
+    """Tokenize the canonical actor prompt, return shared IDs at inj_pos ± 1.
 
     datagen calls this to POPULATE neighbor fields in the sidecar.
     config.py calls this to VERIFY them against the live tokenizer.
@@ -222,13 +234,23 @@ def compute_canonical_neighbors(
         tokenize=True,
         add_generation_prompt=True,
     )
+    assert expected_count > 0, f"expected_count must be positive, got {expected_count}"
     matches = [i for i, tid in enumerate(ids) if tid == injection_token_id]
-    assert len(matches) == 1, (
+    assert len(matches) == expected_count, (
         f"injection token id {injection_token_id} ({injection_char!r}) appears "
-        f"{len(matches)}× in canonical actor prompt (expected 1). Template: {content!r}"
+        f"{len(matches)}× in canonical actor prompt (expected {expected_count}). "
+        f"Template: {content!r}"
     )
-    p = matches[0]
-    assert 0 < p < len(ids) - 1, (
-        f"injection token at position {p} is at edge of sequence (len={len(ids)})"
+    neighbor_pairs: list[tuple[int, int]] = []
+    for p in matches:
+        assert 0 < p < len(ids) - 1, (
+            f"injection token at position {p} is at edge of sequence (len={len(ids)})"
+        )
+        neighbor_pairs.append((ids[p - 1], ids[p + 1]))
+    assert len(set(neighbor_pairs)) == 1, (
+        "all injection sites must have identical immediate token neighbors so "
+        "the shared marker scan is unambiguous; got "
+        f"{neighbor_pairs}. Wrap every site identically (for example "
+        "<concept>{injection_char}</concept>)."
     )
-    return ids[p - 1], ids[p + 1]
+    return neighbor_pairs[0]

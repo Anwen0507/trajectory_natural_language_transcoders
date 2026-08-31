@@ -11,22 +11,14 @@ extraction params. Any mismatch is a hard failure.
 """
 
 import argparse
-import hashlib
 from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from nla.datagen._common import add_storage_args, make_storage
+from nla.datagen.checkpoints import base_dataset_id
 from nla.datagen.sidecar import NLADatasetMeta, read_sidecar, write_sidecar
-
-
-def _merged_dataset_id(base_model: str, layer: int, corpus: str, corpus_slice: dict[str, int]) -> str:
-    # Same hash as stage0_extract._dataset_id — the merged output IS what a
-    # serial stage0 run over this slice would produce, so it gets the same ID.
-    model_tag = base_model.split("/")[-1]
-    h = hashlib.sha256(f"{base_model}|{layer}|{corpus}|{corpus_slice}".encode()).hexdigest()[:8]
-    return f"base_{model_tag}_L{layer}_{h}"
 
 
 def main() -> None:
@@ -52,6 +44,9 @@ def main() -> None:
         e = m.extraction
         assert e.base_model == ref.base_model, f"{path}: base_model {e.base_model!r} != {ref.base_model!r}"
         assert e.layer_index == ref.layer_index, f"{path}: layer_index {e.layer_index} != {ref.layer_index}"
+        assert e.checkpoints == ref.checkpoints, (
+            f"{path}: checkpoints {e.checkpoints} != {ref.checkpoints}"
+        )
         assert e.d_model == ref.d_model, f"{path}: d_model {e.d_model} != {ref.d_model}"
         assert e.norm == ref.norm, f"{path}: norm {e.norm!r} != {ref.norm!r}"
         assert e.corpus == ref.corpus, f"{path}: corpus {e.corpus!r} != {ref.corpus!r}"
@@ -79,12 +74,18 @@ def main() -> None:
 
     storage.ensure_parent(args.output)
     # Smaller row groups so downstream readers don't hit int32 list-offset
-    # overflow on activation_vector (1M rows × d=3584 > 2.1B elements).
+    # overflow on large activation columns (1M rows × d=3584 > 2.1B elements).
     pq.write_table(merged, storage.open_write(args.output), row_group_size=65536)
 
     out_meta = replace(
         metas[0],
-        dataset_id=_merged_dataset_id(ref.base_model, ref.layer_index, ref.corpus, merged_slice),
+        dataset_id=base_dataset_id(
+            ref.base_model,
+            ref.checkpoints,
+            ref.corpus,
+            merged_slice,
+            legacy_layer_index=ref.layer_index,
+        ),
         row_count=row_count,
         extraction=replace(ref, corpus_slice=merged_slice),
         parent_datasets=[m.dataset_id for m in metas],

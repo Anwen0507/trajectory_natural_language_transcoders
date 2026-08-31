@@ -42,7 +42,7 @@ from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
 from nla.injection import inject_at_marked_positions
 from nla.models import NLACriticModel, embed_dump_path
 from nla.schema import (
-    MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY,
+    MM_ACTIVATION_KEY, MM_ACTIVATIONS_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY,
     load_predict_mean_baselines, normalize_activation,
 )
 from nla.storage import _load_storage, is_remote
@@ -543,7 +543,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
             return inject_at_marked_positions(
                 input_ids=inputs[0],
                 embeddings=output,
-                vectors=self._nla_vectors,
+                vectors=self._nla_vectors.reshape(-1, self._nla_cfg.d_model),
                 inj_id=inj, left_id=left, right_id=right,
             )
 
@@ -551,13 +551,31 @@ class NLAFSDPActor(FSDPTrainRayActor):
 
     def _get_model_inputs_args(self, batch):
         mm = batch.get("multimodal_train_inputs")
-        if mm is not None and MM_ACTIVATION_KEY in mm:
-            popped = mm.pop(MM_ACTIVATION_KEY)  # [B, d_model], raw from dataset
+        if mm is not None:
+            bundle = mm.pop(MM_ACTIVATIONS_KEY, None)  # [B, K, d_model]
+            single = mm.pop(MM_ACTIVATION_KEY, None)   # [B, d_model], critic/legacy
             if self._is_critic_model:
-                batch[MM_ACTIVATION_KEY] = popped
-                batch[MM_MSE_SCALE_KEY] = self._nla_cfg.mse_scale
-            else:
-                self._nla_vectors = normalize_activation(popped, self._nla_cfg.injection_scale)
+                if single is not None:
+                    batch[MM_ACTIVATION_KEY] = single
+                    batch[MM_MSE_SCALE_KEY] = self._nla_cfg.mse_scale
+            elif bundle is not None or single is not None:
+                if bundle is None:
+                    bundle = single.unsqueeze(1)
+                assert bundle.ndim == 3, (
+                    f"actor activation bundle must be [B, K, d_model], got "
+                    f"{tuple(bundle.shape)}"
+                )
+                assert tuple(bundle.shape[1:]) == (
+                    self._nla_cfg.num_injection_sites,
+                    self._nla_cfg.d_model,
+                ), (
+                    f"actor activation bundle has shape {tuple(bundle.shape)}, "
+                    f"expected [B, {self._nla_cfg.num_injection_sites}, "
+                    f"{self._nla_cfg.d_model}]"
+                )
+                self._nla_vectors = normalize_activation(
+                    bundle, self._nla_cfg.injection_scale
+                )
         model_args = super()._get_model_inputs_args(batch)
         # use_cache=False kills TWO bugs, both via the same DynamicCache:
         #

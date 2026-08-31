@@ -18,23 +18,32 @@ from pathlib import Path
 
 import yaml
 
+from nla.datagen.checkpoints import (
+    ActivationCheckpoint,
+    checkpoint_for_depth,
+    checkpoints_for_depths,
+)
 from nla.datagen.storage import Storage, sidecar_path_str
 from nla.schema import NLATokenMeta, sidecar_path_for
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_READABLE_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
 
 
 @dataclass
 class NLAExtractionMeta:
     base_model: str
     d_model: int
-    layer_index: int
+    # Legacy single-layer convention: zero-based decoder block index. New
+    # multi-checkpoint datasets set this to None and use `checkpoints`.
+    layer_index: int | None
     norm: str  # data-gen always writes "none" (raw vectors). Training decides
     # how/whether to normalize at load time. Field stays for forward-compat
     # and so training can assert on what it's reading.
     corpus: str
     corpus_slice: dict[str, int]
     positions_per_doc: int
+    checkpoints: list[ActivationCheckpoint] = field(default_factory=list)
 
 
 @dataclass
@@ -73,8 +82,29 @@ def _git_commit() -> str:
 _TRAINING_STAGES = {"av_sft", "ar_sft", "rl"}
 
 
+def _validate_extraction_checkpoints(extraction: NLAExtractionMeta) -> None:
+    assert extraction.checkpoints, "extraction.checkpoints must not be empty"
+    depths = [checkpoint.depth for checkpoint in extraction.checkpoints]
+    checkpoints_for_depths(depths)
+    if extraction.layer_index is not None:
+        assert len(extraction.checkpoints) == 1, (
+            "extraction.layer_index is only valid for a single-checkpoint dataset"
+        )
+        checkpoint = extraction.checkpoints[0]
+        assert checkpoint.layer_index == extraction.layer_index, (
+            f"layer_index={extraction.layer_index} disagrees with "
+            f"checkpoint={checkpoint}"
+        )
+
+
 def serialize_sidecar(meta: NLADatasetMeta) -> str:
     """Validate + serialize to YAML string. Pure — no IO."""
+    if not meta.extraction.checkpoints and meta.extraction.layer_index is not None:
+        # Preserve the construction API used before multi-checkpoint metadata.
+        meta.extraction.checkpoints = [
+            checkpoint_for_depth(meta.extraction.layer_index + 1)
+        ]
+    _validate_extraction_checkpoints(meta.extraction)
     if meta.stage in _TRAINING_STAGES:
         assert meta.tokens is not None, (
             f"stage={meta.stage!r} requires NLATokenMeta — training-side config.py "
@@ -83,6 +113,14 @@ def serialize_sidecar(meta: NLADatasetMeta) -> str:
         assert meta.prompt_templates.get("actor"), (
             f"stage={meta.stage!r} requires prompt_templates['actor'] — training MUST use "
             f"the exact template or injection position drifts."
+        )
+        actor_template = meta.prompt_templates["actor"]
+        expected_sites = len(meta.extraction.checkpoints)
+        actual_sites = actor_template.count("{injection_char}")
+        assert actual_sites == expected_sites, (
+            f"stage={meta.stage!r} actor template has {actual_sites} "
+            f"'{{injection_char}}' sites, but extraction.checkpoints has "
+            f"{expected_sites}. Prompt order and checkpoint order are one contract."
         )
         if meta.stage == "ar_sft":
             assert meta.tokens.critic_suffix_ids is not None, (
@@ -107,11 +145,28 @@ def deserialize_sidecar(text: str) -> NLADatasetMeta:
     """Parse + validate from YAML string. Pure — no IO."""
     d = yaml.safe_load(text)
     assert d["kind"] == "nla_dataset", f"not an NLA dataset sidecar: kind={d['kind']!r}"
-    assert d["schema_version"] == SCHEMA_VERSION, (
-        f"sidecar schema version {d['schema_version']} != expected {SCHEMA_VERSION}"
+    source_version = d["schema_version"]
+    assert source_version in _READABLE_SCHEMA_VERSIONS, (
+        f"unsupported sidecar schema version {source_version}; "
+        f"readable versions are {sorted(_READABLE_SCHEMA_VERSIONS)}"
     )
 
-    d["extraction"] = NLAExtractionMeta(**d["extraction"])
+    extraction = d["extraction"]
+    checkpoint_dicts = extraction.get("checkpoints")
+    if checkpoint_dicts is None:
+        # Schema v1 only had a zero-based block layer_index.
+        layer_index = extraction["layer_index"]
+        checkpoint_dicts = [asdict(checkpoint_for_depth(layer_index + 1))]
+    extraction.setdefault("layer_index", None)
+    extraction["checkpoints"] = [
+        checkpoint if isinstance(checkpoint, ActivationCheckpoint)
+        else ActivationCheckpoint(**checkpoint)
+        for checkpoint in checkpoint_dicts
+    ]
+    d["extraction"] = NLAExtractionMeta(**extraction)
+    _validate_extraction_checkpoints(d["extraction"])
+    # Anything read and subsequently written uses the current schema.
+    d["schema_version"] = SCHEMA_VERSION
     if d.get("tokens") is not None:
         d["tokens"] = NLATokenMeta(**d["tokens"])
     if d.get("api_summaries") is not None:

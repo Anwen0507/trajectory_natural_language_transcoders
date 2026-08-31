@@ -41,7 +41,15 @@ from nla.arch_adapters import resolve_embed_scale
 from nla.config import load_nla_config_from_args
 from nla.injection import inject_at_marked_positions
 from nla.models import embed_dump_path, load_embedding_only
-from nla.schema import MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, extract_explanation, normalize_activation
+from nla.schema import (
+    ACTIVATION_COLUMN,
+    ACTIVATIONS_KEY,
+    MM_ACTIVATION_KEY,
+    MM_ACTIVATIONS_KEY,
+    MM_CRITIC_TOKENS_KEY,
+    extract_explanation,
+    normalize_activation,
+)
 
 
 _TOKENIZER = None
@@ -156,7 +164,7 @@ def _maybe_reload_embed(args):
 _DEBUG_TIMING = os.environ.get("NLA_DEBUG_TIMING") == "1"
 
 
-def _prep_payload_sync(args, messages, activation_vector, sampling_params, sample_index):
+def _prep_payload_sync(args, messages, activation_vectors, sampling_params, sample_index):
     """Everything CPU-bound before the HTTP call. Runs in a thread so the
     ~30ms of tokenize + embed + tensor-from-list + inject doesn't block the
     event loop. Without this, 512 coroutines trickle to SGLang at ~30 req/s;
@@ -186,20 +194,28 @@ def _prep_payload_sync(args, messages, activation_vector, sampling_params, sampl
 
     # np.asarray avoids Python-list iteration (5376 elements). torch.from_numpy
     # is zero-copy on the numpy buffer.
-    v_np = np.asarray(activation_vector, dtype=np.float32)
+    v_np = np.asarray(activation_vectors, dtype=np.float32)
+    if v_np.ndim == 1:  # legacy single-vector caller
+        v_np = v_np[None, :]
+    expected_shape = (_CFG.num_injection_sites, _CFG.d_model)
+    assert v_np.shape == expected_shape, (
+        f"activation bundle has shape {v_np.shape}, expected {expected_shape} "
+        f"for checkpoints {_CFG.activation_checkpoint_names} "
+        f"(sample index={sample_index})"
+    )
     assert np.isfinite(v_np).all(), (
-        f"activation_vector has NaN/Inf (sample index={sample_index}). "
+        f"activation bundle has NaN/Inf (sample index={sample_index}). "
         f"Bad stage0 extraction — check the parquet."
     )
-    v_raw = torch.from_numpy(v_np).view(1, -1)  # [1, d]
+    v_raw = torch.from_numpy(v_np).unsqueeze(0)  # [1, K, d]
     v_scaled = normalize_activation(v_raw, _CFG.injection_scale)
 
-    # Reuses the pure injection fn — asserts exactly 1 match with correct
-    # neighbors. On miss, AssertionError here is LOUD (not graceful) — if
+    # Reuses the pure injection fn — asserts exactly K matches with correct
+    # neighbors. On miss, RuntimeError here is LOUD (not graceful) — if
     # the prompt template drifted this badly, the whole RL run is garbage
     # and should crash, not silently train on ㊗-as-text.
     embeds_injected = inject_at_marked_positions(
-        ids_tensor, embeds, v_scaled,
+        ids_tensor, embeds, v_scaled.reshape(-1, _CFG.d_model),
         _CFG.injection_token_id, _CFG.injection_left_neighbor_id,
         _CFG.injection_right_neighbor_id,
     )  # [1, T, d]
@@ -258,8 +274,19 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         f"happens there."
     )
 
+    activation_vectors = sample.metadata.get(ACTIVATIONS_KEY)
+    if activation_vectors is None:
+        activation_vectors = sample.metadata.get(ACTIVATION_COLUMN)
+    assert activation_vectors is not None, (
+        f"sample index={sample.index} has neither {ACTIVATIONS_KEY!r} nor "
+        f"legacy {ACTIVATION_COLUMN!r} metadata"
+    )
+
     input_ids, v_raw, embeds_out, payload, halt_status = await asyncio.to_thread(
-        _prep_payload_sync, args, messages, sample.metadata["activation_vector"],
+        _prep_payload_sync,
+        args,
+        messages,
+        activation_vectors,
         sampling_params, sample.index,
     )
     if payload is None:
@@ -348,7 +375,10 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
 
     # Stash RAW activation for both actor training (scaled in
     # _get_model_inputs_args) and critic training (scaled per mse_scale).
-    sample.multimodal_train_inputs = {MM_ACTIVATION_KEY: v_raw}
+    sample.multimodal_train_inputs = {MM_ACTIVATIONS_KEY: v_raw}
+    if _CFG.num_injection_sites == 1:
+        # Preserve the existing AR/reward contract for legacy/single-site RL.
+        sample.multimodal_train_inputs[MM_ACTIVATION_KEY] = v_raw[:, 0, :]
 
     explanation = extract_explanation(sample.response)
 
